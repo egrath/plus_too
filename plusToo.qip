@@ -1,5 +1,6 @@
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) plusToo_top.sv]
 set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) cpu_module.v]
+set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) m68k_cache.v]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) fx68k/uaddrPla.sv]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) fx68k/fx68kAlu.sv]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) fx68k/fx68k.sv]
