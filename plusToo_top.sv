@@ -149,7 +149,8 @@ assign SDRAM2_nWE = 1;
 
 `include "build_id.v"
 
-assign LED = ~(dio_download || dio_upload || |(diskAct ^ diskMotor));
+//assign LED = ~(dio_download || dio_upload || |(diskAct ^ diskMotor));
+assign LED = ~cache_hit;   // LED on when a cache hit occurs (active low)
 
 localparam SCSI_DEVS = 4;
 // ------------------------------ Plus Too Bus Timing ---------------------------------
@@ -247,10 +248,6 @@ always @(posedge clk32) begin
 	end
 end
 
-// Cache invalidation logic: we need to invalidate the cache as soon as a new disk image
-// has been loaded as we might have cached something which is no longer valid then.
-assign cache_invalidate = (~download_cycle && download_cycle_d) || !_cpuReset;
-
 // keys and switches are dummies as the mist doesn't have any ...
 wire [9:0] sw = 10'd0;
 wire [3:0] key = 4'd0;
@@ -282,7 +279,7 @@ wire [3:0] key = 4'd0;
 		"S3,IMGVHDHD?,Mount SCSI3;",
 		`SEP
 		"O4,Memory,1MB,4MB;",
-		"O5,Speed,8MHz,16MHz-Cache;",
+		"O5,Speed,8MHz,16MHz;",
 		"O67,CPU,FX68K-68000,TG68K-68010,TG68K-68020;",
 		"R256,Save PRAM;",
 		`SEP
@@ -423,22 +420,6 @@ wire [3:0] key = 4'd0;
 	wire [21:0] dskReadAddrInt;
 	wire dskReadAckExt;
 	wire [21:0] dskReadAddrExt;
-	
-	// Cache signals
-	wire        cpu_req;
-	wire        cpu_rw;
-	wire [23:1] cpu_addr_cache;
-	wire [1:0]  cpu_ds_cache;
-	wire [15:0] cpu_dout_cache;
-	wire        cpu_dtack_cache;
-	wire        cache_active;
-	wire        mem_req_cache;
-	wire        mem_rw_cache;
-	wire [21:0] mem_addr_cache;
-	wire [1:0]  mem_ds_cache;
-	wire [15:0] mem_dout_cache;
-	wire        mem_dtack_cache;
-	wire        cache_invalidate;
 
 	// dtack generation in turbo mode
 	reg  turbo_dtack_en, cpuBusControl_d;
@@ -490,11 +471,36 @@ wire [3:0] key = 4'd0;
 	wire        E_rising  = speed ? E_GLUE_p : E_CPU_p;
 	wire        E_falling = speed ? E_GLUE_n : E_CPU_n;
 
+	// ============================================================
+	// CACHE: Cache integration signals
+	// ============================================================
+	wire        cpu_req;
+	wire        cpu_rw;
+	wire [1:0]  cpu_ds_cache;
+	wire [15:0] cpu_dout_cache;
+	wire        cpu_dtack_cache;
+	wire        cache_active;
+	wire        cache_hit;
+	wire        cache_miss;
+	wire        mem_req_cache;
+	wire        mem_rw_cache;
+	wire [21:0] mem_addr_cache;
+	wire [1:0]  mem_ds_cache;
+	wire [15:0] mem_dout_cache;
+	wire        mem_dtack_cache;
+	wire        cache_invalidate;
+
+	// Invalidation: trigger on download completion or reset
+	assign cache_invalidate = (~download_cycle && download_cycle_d) || !_cpuReset;
+
 	// CPU bus control signals for cache
 	assign cpu_req = cpuBusControl;
 	assign cpu_rw = _cpuRW;
 	assign cpu_ds_cache = {~_cpuUDS, ~_cpuLDS};
-	
+
+	// mem_dtack for cache: use the original DTACK signal
+	assign mem_dtack_cache = _cpuDTACK;
+
 	cpu_module cpu_module (
 		.clk         ( clk32        ),
 		._cpuReset   ( _cpuReset    ),
@@ -502,7 +508,7 @@ wire [3:0] key = 4'd0;
 		.cpu_en_n    ( cpu_en_n     ),
 		.cpu         ( {status_cpu[1], |status_cpu} ),
 
-		._cpuDTACK   ( cpu_dtack_cache ),  // Now driven by cache module
+		._cpuDTACK   (  cache_active ? cpu_dtack_cache : _cpuDTACK ),
 		._cpuRW      ( _cpuRW       ),
 		._cpuAS      ( _cpuAS       ),
 		._cpuUDS     ( _cpuUDS      ),
@@ -516,12 +522,14 @@ wire [3:0] key = 4'd0;
 		._cpuVPA     ( _cpuVPA      ),
 
 		._cpuIPL     ( _cpuIPL      ),
-		.cpuDataIn   ( cpu_dout_cache ),  // Data from cache module
+		.cpuDataIn   ( cache_active ? (cache_hit ? cpu_dout_cache : dataControllerDataOut) : dataControllerDataOut ),
 		.cpuDataOut  ( cpuDataOut   ),
 		.cpuAddr     ( cpuAddr[23:1])
 	);
-	
-	// Instantiate our cache
+
+	// ============================================================
+	// CACHE: Cache Module Instantiation
+	// ============================================================
 	m68k_cache cache (
 		.clk              ( clk32              ),
 		.reset            ( _cpuReset          ),
@@ -535,6 +543,8 @@ wire [3:0] key = 4'd0;
 		.cpu_dout         ( cpu_dout_cache     ),
 		.cpu_dtack        ( cpu_dtack_cache    ),
 		.cache_active     ( cache_active       ),
+		.cache_hit        ( cache_hit          ),
+		.cache_miss       ( cache_miss         ),
 		
 		// Memory interface
 		.mem_req          ( mem_req_cache      ),
@@ -691,7 +701,7 @@ wire [3:0] key = 4'd0;
 		.cpuBusControl(cpuBusControl),
 		.videoBusControl(videoBusControl),
 		.memoryDataOut(memoryDataOut),
-		.memoryDataIn(cache_active ? cpu_dout_cache : sdram_do),
+		.memoryDataIn(sdram_do),
 		.memoryLatch(memoryLatch),
 
 		// peripherals
@@ -849,54 +859,28 @@ assign HDMI_PCLK = clk32;
 // sdram used for ram/rom maps directly into 68k address space
 wire download_cycle = dio_download && dioBusControl;
 
-// SDRAM access control with cache integration
-wire cache_access = mem_req_cache && !download_cycle;
-wire [24:0] sdram_addr = download_cycle   ? { 4'b0001, dio_a[21:1] } :
-                          cache_access    ? { 3'b000, mem_addr_cache } :
-                                            { 3'b000, ~_romOE, memoryAddr[21:1] };
-wire [15:0] sdram_din = download_cycle ? {dio_data, dio_data} :
-                         cache_access  ? mem_dout_cache :
-                                         memoryDataOut;
-wire [1:0] sdram_ds = download_cycle ? {~dio_addr[0], dio_addr[0]} :
-                       cache_access  ? mem_ds_cache :
-                                       { !_memoryUDS, !_memoryLDS };
-wire sdram_we = download_cycle ? dio_write :
-                 cache_access  ? ~mem_rw_cache :
-                                 !_ramWE;
-wire sdram_oe = download_cycle ? 1'b0 :
-                 cache_access  ? mem_rw_cache :
-                                 (!_ramOE || !_romOE);
+// ============================================================
+// SDRAM Multiplexer - Original
+// ============================================================
+wire [24:0] sdram_addr = download_cycle ? { 4'b0001, dio_a[21:1] } : { 3'b000, ~_romOE, memoryAddr[21:1] };
+wire [15:0] sdram_din = download_cycle ? {dio_data, dio_data} : memoryDataOut;
+wire [1:0] sdram_ds = download_cycle ? {~dio_addr[0], dio_addr[0]} : { !_memoryUDS, !_memoryLDS };
+wire sdram_we = download_cycle ? dio_write : !_ramWE;
+wire sdram_oe = download_cycle ? 1'b0 : (!_ramOE || !_romOE);
 
 // during rom/disk download ffff is returned so the screen is black during download
 // "extra rom" is used to hold the disk image. It's expected to be byte wide and
 // we thus need to properly demultiplex the word returned from sdram in that case
 wire [15:0] extra_rom_data_demux = memoryAddr[0]?
 	{sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
-wire [15:0] sdram_do = download_cycle ? 16'hffff :
-                        (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-                        sdram_out;
+wire [15:0] sdram_do = download_cycle?16'hffff:
+	(dskReadAckInt || dskReadAckExt)?extra_rom_data_demux:
+	sdram_out;
 
-// DTACK generation for cache misses
-// When cache is active and misses, it handles DTACK
-// When cache is bypassed (8MHz mode), use original DTACK logic
-// The SDRAM controller responds when a request is active
-// We can use the existing sdram control signals to generate a dtack
-// DTACK is active when:
-// 1. The cache is requesting memory access
-// 2. The SDRAM controller has acknowledged by starting the cycle
-// We approximate this with the SDRAM access signals
-reg sdram_access_pending;
-always @(posedge clk32) begin
-    if (mem_req_cache && !download_cycle)
-        sdram_access_pending <= 1'b1;
-    else if (sdram_access_pending && !sdram_we && !sdram_oe)
-        sdram_access_pending <= 1'b0;
-end
-assign mem_dtack_cache = sdram_access_pending && !sdram_we && !sdram_oe;
-
-// SDRAM interfacing
 wire [15:0] sdram_out;
+
 assign SDRAM_CKE         = 1'b1;
+
 sdram sdram (
 	// interface to the MT48LC16M16 chip
 	.sd_data        ( SDRAM_DQ                 ),
